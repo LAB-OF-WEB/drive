@@ -80,5 +80,5 @@ const srcUrl = computed(() =>
     ).href
   )
 )
-const download = () => (window.location.ref = srcUrl.value)
+const download = () => (window.location.href = srcUrl.value)
 </script>
