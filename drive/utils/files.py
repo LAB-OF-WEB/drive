@@ -212,21 +212,71 @@ class FileManager:
         """
         Function to get a file, with an optional range header for S3 objects
         """
+        if self.s3_enabled:
+            return self._get_file_s3(entity, range_header)
+
         try:
-            if self.s3_enabled:
-                if range_header:
-                    buf = self.conn.get_object(
-                        Bucket=self.get_bucket(entity.team), Key=entity.path, Range=range_header
-                    )["Body"]
-                else:
-                    buf = self.conn.get_object(Bucket=self.get_bucket(entity.team), Key=entity.path)["Body"]
-            else:
-                with open(self.site_folder / entity.path, "rb") as fh:
-                    buf = BytesIO(fh.read())
-        except BaseException:
-            frappe.throw("Could not find this file", frappe.NotFound)
+            with open(self.site_folder / entity.path, "rb") as fh:
+                buf = BytesIO(fh.read())
+        except (FileNotFoundError, TypeError, OSError):
+            # Path drift self-heal: a file may have been moved/renamed on disk
+            # without its Drive File path being updated (or vice versa). Fall
+            # back to the canonical path derived from the folder tree, and
+            # repair the record so subsequent downloads resolve directly.
+            canonical = self._canonical_disk_path(entity)
+            if not canonical or not (self.site_folder / canonical).is_file():
+                frappe.throw("Could not find this file", frappe.NotFound)
+            frappe.log_error(
+                message=(
+                    f"Drive File {entity.name} ({entity.title}) not found at "
+                    f"'{entity.path}'. Recovered from canonical path '{canonical}'."
+                ),
+                title="Drive Path Drift (recovered)",
+            )
+            frappe.db.set_value("Drive File", entity.name, "path", str(canonical))
+            with open(self.site_folder / canonical, "rb") as fh:
+                buf = BytesIO(fh.read())
 
         return buf
+
+    def _get_file_s3(self, entity, range_header=None):
+        if range_header:
+            buf = self.conn.get_object(
+                Bucket=self.get_bucket(entity.team), Key=entity.path, Range=range_header
+            )["Body"]
+        else:
+            buf = self.conn.get_object(Bucket=self.get_bucket(entity.team), Key=entity.path)["Body"]
+        return buf
+
+    def _canonical_disk_path(self, entity):
+        """Recompute the on-disk path of a file from the folder tree."""
+        if self.flat:
+            return Path(entity.name)
+
+        chain = []
+        cur_name = entity.parent_entity
+        guard = 0
+        while cur_name and guard < 50:
+            row = frappe.db.get_value(
+                "Drive File", cur_name, ["title", "path", "parent_entity", "is_group"], as_dict=True
+            )
+            if not row:
+                break
+            chain.append(row)
+            if row.is_group == 0 or not row.parent_entity:
+                break
+            cur_name = row.parent_entity
+            guard += 1
+        if not chain:
+            return None
+
+        # Walk parents until the root folder (whose path is the home-folder name)
+        chain.reverse()
+        root = chain[0]
+        base = (root["path"] or "").rstrip("/")
+        if not base:
+            return None
+        return Path(base) / Path(*[r["title"] for r in chain[1:]]) / entity.title
 
     def write_file(self, path: str | Path, content: str):
         if self.s3_enabled:

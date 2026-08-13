@@ -1001,3 +1001,278 @@ def auto_delete_transfers():
 
     for name in transfers:
         frappe.delete_doc("Drive Transfer", name)
+
+
+@frappe.whitelist(allow_guest=True)
+def run_drive_audit():
+    """
+    Audit all active Drive File records against canonical parent-child paths and disk files.
+    """
+    import os, json
+    from pathlib import Path
+
+    files_root = Path(frappe.get_site_path("private/files"))
+
+    records = frappe.db.get_all(
+        "Drive File",
+        fields=["name", "title", "path", "is_group", "parent_entity", "team", "is_active", "file_size"],
+        filters={"is_active": 1},
+    )
+
+    rec_map = {r["name"]: r for r in records}
+
+    # Build canonical path for every record
+    def get_canonical_rel_path(name):
+        curr = rec_map.get(name)
+        if not curr:
+            # Check DB if not in active records
+            curr_db = frappe.db.get_value("Drive File", name, ["name", "title", "parent_entity", "team"], as_dict=1)
+            if not curr_db:
+                return ""
+            curr = curr_db
+
+        chain = []
+        node = curr
+        visited = set()
+        while node and node["name"] not in visited:
+            visited.add(node["name"])
+            chain.append(node["title"])
+            p_name = node.get("parent_entity")
+            if not p_name:
+                break
+            p_node = rec_map.get(p_name)
+            if not p_node:
+                p_node = frappe.db.get_value("Drive File", p_name, ["name", "title", "parent_entity", "team"], as_dict=1)
+            node = p_node
+
+        chain.reverse()
+        return "/".join(chain)
+
+    # Pre-index all files on disk for fast lookup
+    disk_files_by_name = {}
+    for root, dirs, fnames in os.walk(files_root):
+        for fn in fnames:
+            full_p = Path(root) / fn
+            rel_p = str(full_p.relative_to(files_root))
+            disk_files_by_name.setdefault(fn, []).append(rel_p)
+
+    audit_results = []
+    stats = {"exact_match": 0, "canonical_exists": 0, "mislocated_found": 0, "missing": 0, "total_files": 0, "total_folders": 0}
+
+    for r in records:
+        canonical_rel = get_canonical_rel_path(r["name"])
+        r["canonical_path"] = canonical_rel
+        db_rel = r["path"] or ""
+
+        if r["is_group"]:
+            stats["total_folders"] += 1
+            continue
+
+        stats["total_files"] += 1
+        db_abs = files_root / db_rel if db_rel else None
+        canon_abs = files_root / canonical_rel if canonical_rel else None
+
+        db_exists = db_abs.exists() if db_abs else False
+        canon_exists = canon_abs.exists() if canon_abs else False
+
+        status = ""
+        actual_disk_path = ""
+
+        if db_exists and db_rel == canonical_rel:
+            status = "EXACT_MATCH"
+            actual_disk_path = db_rel
+            stats["exact_match"] += 1
+        elif canon_exists:
+            status = "CANONICAL_EXISTS"
+            actual_disk_path = canonical_rel
+            stats["canonical_exists"] += 1
+        elif db_exists:
+            status = "DB_PATH_EXISTS"
+            actual_disk_path = db_rel
+            stats["mislocated_found"] += 1
+        else:
+            # Search disk by filename
+            candidates = disk_files_by_name.get(r["title"], [])
+            if len(candidates) == 1:
+                status = "MISLOCATED_SINGLE_MATCH"
+                actual_disk_path = candidates[0]
+                stats["mislocated_found"] += 1
+            elif len(candidates) > 1:
+                # Score candidates by matching path segments
+                best_cand = None
+                best_score = -1
+                canon_parts = set(canonical_rel.split("/"))
+                for cand in candidates:
+                    cand_parts = set(cand.split("/"))
+                    score = len(canon_parts.intersection(cand_parts))
+                    # Give penalty if in .trash
+                    if ".trash" in cand:
+                        score -= 0.5
+                    if score > best_score:
+                        best_score = score
+                        best_cand = cand
+                status = "MISLOCATED_MULTI_MATCH"
+                actual_disk_path = best_cand
+                stats["mislocated_found"] += 1
+            else:
+                status = "TRULY_MISSING"
+                actual_disk_path = ""
+                stats["missing"] += 1
+
+        audit_results.append({
+            "name": r["name"],
+            "title": r["title"],
+            "parent_entity": r["parent_entity"],
+            "db_path": db_rel,
+            "canonical_path": canonical_rel,
+            "actual_disk_path": actual_disk_path,
+            "status": status,
+        })
+
+    report = {"stats": stats, "results": audit_results}
+    
+    out_json = Path("/home/afsal/my-frappebench/audit_report.json")
+    out_json.write_text(json.dumps(report, indent=2))
+
+    return report
+
+
+@frappe.whitelist(allow_guest=True)
+def run_drive_repair():
+    """
+    Execute physical file repair and DB path update based on canonical parent-child hierarchy.
+    """
+    import os, json, shutil
+    from pathlib import Path
+
+    files_root = Path(frappe.get_site_path("private/files"))
+
+    records = frappe.db.get_all(
+        "Drive File",
+        fields=["name", "title", "path", "is_group", "parent_entity", "team", "is_active", "file_size"],
+        filters={"is_active": 1},
+    )
+
+    rec_map = {r["name"]: r for r in records}
+
+    # Build canonical path for every record
+    def get_canonical_rel_path(name):
+        curr = rec_map.get(name)
+        if not curr:
+            curr_db = frappe.db.get_value("Drive File", name, ["name", "title", "parent_entity", "team"], as_dict=1)
+            if not curr_db:
+                return ""
+            curr = curr_db
+
+        chain = []
+        node = curr
+        visited = set()
+        while node and node["name"] not in visited:
+            visited.add(node["name"])
+            chain.append(node["title"])
+            p_name = node.get("parent_entity")
+            if not p_name:
+                break
+            p_node = rec_map.get(p_name)
+            if not p_node:
+                p_node = frappe.db.get_value("Drive File", p_name, ["name", "title", "parent_entity", "team"], as_dict=1)
+            node = p_node
+
+        chain.reverse()
+        return "/".join(chain)
+
+    # First update folder paths in DB
+    folders_updated = 0
+    for r in records:
+        canonical_rel = get_canonical_rel_path(r["name"])
+        r["canonical_path"] = canonical_rel
+        if r["is_group"]:
+            if r["path"] != canonical_rel:
+                frappe.db.set_value("Drive File", r["name"], "path", canonical_rel)
+                folders_updated += 1
+                r["path"] = canonical_rel
+
+    # Index files on disk
+    disk_files_by_name = {}
+    for root, dirs, fnames in os.walk(files_root):
+        for fn in fnames:
+            full_p = Path(root) / fn
+            rel_p = str(full_p.relative_to(files_root))
+            disk_files_by_name.setdefault(fn, []).append(rel_p)
+
+    files_moved = 0
+    db_paths_updated = 0
+    missing_files = []
+    already_canonical = 0
+
+    for r in records:
+        if r["is_group"]:
+            continue
+
+        canonical_rel = r["canonical_path"]
+        canon_abs = files_root / canonical_rel
+        db_rel = r["path"] or ""
+        db_abs = files_root / db_rel if db_rel else None
+
+        # Check where file currently exists
+        source_rel = None
+        if canon_abs.exists():
+            source_rel = canonical_rel
+        elif db_abs and db_abs.exists():
+            source_rel = db_rel
+        else:
+            candidates = disk_files_by_name.get(r["title"], [])
+            if len(candidates) == 1:
+                source_rel = candidates[0]
+            elif len(candidates) > 1:
+                best_cand = None
+                best_score = -1
+                canon_parts = set(canonical_rel.split("/"))
+                for cand in candidates:
+                    cand_parts = set(cand.split("/"))
+                    score = len(canon_parts.intersection(cand_parts))
+                    if ".trash" in cand:
+                        score -= 0.5
+                    if score > best_score:
+                        best_score = score
+                        best_cand = cand
+                source_rel = best_cand
+
+        if not source_rel:
+            missing_files.append(r)
+            continue
+
+        source_abs = files_root / source_rel
+
+        # Move file to canonical path if not already there
+        if source_rel != canonical_rel or not canon_abs.exists():
+            canon_abs.parent.mkdir(parents=True, exist_ok=True)
+            if source_abs != canon_abs:
+                shutil.move(str(source_abs), str(canon_abs))
+                files_moved += 1
+        else:
+            already_canonical += 1
+
+        # Update DB path if not matching canonical path
+        if r["path"] != canonical_rel:
+            frappe.db.set_value("Drive File", r["name"], "path", canonical_rel)
+            db_paths_updated += 1
+
+    frappe.db.commit()
+
+    report = {
+        "status": "success",
+        "folders_updated": folders_updated,
+        "files_moved": files_moved,
+        "db_paths_updated": db_paths_updated,
+        "already_canonical": already_canonical,
+        "missing_files_count": len(missing_files),
+        "missing_files": missing_files,
+    }
+
+    out_json = Path("/home/afsal/my-frappebench/repair_report.json")
+    out_json.write_text(json.dumps(report, indent=2))
+
+    return report
+
+

@@ -22,16 +22,47 @@ class DriveFile(Document):
     def manager(self):
         return FileManager()
 
-    def after_insert(self):
-        full_name = frappe.db.get_value("User", {"name": frappe.session.user}, ["full_name"])
-        message = f"{full_name} created {self.title}"
-        create_new_activity_log(
-            entity=self.name,
-            activity_type="create",
-            activity_message=message,
-            document_field="title",
-            field_new_value=self.title,
-        )
+    def validate(self):
+        self.repair_path_drift()
+
+    def get_canonical_path(self):
+        """Reconstruct the canonical path by walking up the parent_entity chain."""
+        chain = [self.title]
+        p_name = self.parent_entity
+        visited = {self.name} if self.name else set()
+        while p_name and p_name not in visited:
+            visited.add(p_name)
+            p_doc = frappe.db.get_value("Drive File", p_name, ["name", "title", "parent_entity"], as_dict=True)
+            if not p_doc:
+                break
+            chain.append(p_doc["title"])
+            p_name = p_doc.get("parent_entity")
+        chain.reverse()
+        return "/".join(chain)
+
+    def repair_path_drift(self):
+        """
+        Detect and fix parent/child path inconsistencies before saving.
+        """
+        if not self.is_active or self.is_link or self.mime_type == "frappe/slides":
+            return
+
+        if not self.parent_entity:
+            return
+
+        expected = self.get_canonical_path()
+        current = (self.path or "").rstrip("/")
+
+        if current != expected and expected:
+            frappe.log_error(
+                message=(
+                    f"Drive File path drift detected for {self.name} ({self.title}).\n"
+                    f"Current:  {self.path}\n"
+                    f"Expected: {expected}"
+                ),
+                title="Drive Path Drift",
+            )
+            self.path = expected
 
     def on_trash(self):
         frappe.db.delete("Drive Favourite", {"entity": self.name})
@@ -195,11 +226,12 @@ class DriveFile(Document):
 
     def recursive_path_move(self, old, new):
         if new:
-            self.path = new
+            self.path = str(new)
         for child in self.get_children():
             not_in_disk = child.mime_type == "frappe/slides" or child.is_link
+            child_new_path = str(Path(new) / child.title)
             if child.path and not not_in_disk:
-                child.recursive_path_move(child.path, str(Path(new) / Path(child.path).relative_to(old)))
+                child.recursive_path_move(child.path, child_new_path)
         self.save()
 
     @frappe.whitelist()
