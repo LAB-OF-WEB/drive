@@ -1,148 +1,211 @@
 """
-Drive Path Drift Repair - one-shot patch for a live site.
+Reusable Drive Path Repair patch - registered in the drive app.
 
-Fixes filename/path mismatches between the Drive File records (tabDrive File)
-and the actual files on disk, using the DB tree as the single source of truth.
+Works on ANY Frappe/Drive site. Two ways to run it:
 
-Run on the live site:
+  1) Via bench (frappe context - uses the site's own DB):
 
-    bench --site YOUR_SITE execute drive.utils.repair_paths.run
+       bench --site YOUR_SITE execute drive.utils.repair_paths.run
+       bench --site YOUR_SITE execute drive.utils.repair_paths.run --kwargs "{'dry_run': 1}"
+       bench --site YOUR_SITE execute drive.utils.repair_paths.verify
 
-What it does per active non-group file:
-  1. Computes the canonical path from the parent_entity folder chain.
-  2. If the stored path already matches the canonical path -> OK (no change).
-  3. If the file exists at the canonical path -> only fix the DB path.
-  4. If the file exists elsewhere on disk -> move it to the canonical path,
-     then fix the DB path.
-  5. If the file only exists in the team .trash -> restore it, fix DB path.
-  6. Otherwise -> flag as MISSING (needs manual attention).
-Also repairs team mismatches (file team must equal its parent folder's team).
+  2) Standalone (no bench, uses pymysql + site_config.json directly):
 
-It never deletes anything. Run it with --dry-run first to review the plan.
+       python3 -m drive.utils.repair_paths --site YOUR_SITE [--bench-dir ~/frappe-bench] [--apply] [--verify]
+
+It repairs filename/path mismatches between tabDrive File and the files on disk,
+using the DB folder tree as the single source of truth:
+
+  1. Computes the canonical path by walking the parent_entity folder chain.
+  2. Stored path matches canonical AND file exists on disk -> OK (no change).
+  3. File exists at canonical path -> only fix the DB path.
+  4. File exists elsewhere on disk -> move it to canonical, fix DB path.
+  5. File only in team .trash -> restore, fix DB path.
+  6. Otherwise -> flag MISSING (no bytes on disk; needs upload).
+Also repairs team mismatches (file team must equal parent folder team).
+
+It NEVER deletes anything. Run with dry_run=True first to review the plan.
 """
 
-import os
+import argparse
 import shutil
+import sys
 from pathlib import Path
 
 import frappe
-from frappe.utils import cint
 
-from drive.utils import get_home_folder
-from drive.utils.files import FileManager
-
-DEBUG = True
+# ---------------------------------------------------------------------------
+# DB abstraction - works in frappe context and standalone (pymysql) mode.
+# ---------------------------------------------------------------------------
 
 
-def log(msg):
-    line = f"[repair_paths] {msg}"
-    print(line)
-    if DEBUG:
-        frappe.logger().info(line)
+class _DB:
+    """Thin wrapper so callers use fetchone/fetchall/execute the same way in
+    frappe context and in standalone pymysql mode."""
 
-SITE_FOLDER = FileManager().site_folder
-SKIP_PARTS = {".trash", ".thumbnails", ".embeds"}
+    def __init__(self, conn=None):
+        self._pymysql = conn
+        self._frappe = conn is None
+
+    def fetchone(self, sql, params=None):
+        if self._frappe:
+            row = frappe.db.sql(sql, params or (), as_dict=False)
+            return row[0] if row else None
+        cur = self._pymysql.cursor()
+        cur.execute(sql, params or ())
+        row = cur.fetchone()
+        cur.close()
+        return row
+
+    def fetchall(self, sql, params=None):
+        if self._frappe:
+            return frappe.db.sql(sql, params or (), as_dict=False)
+        cur = self._pymysql.cursor()
+        cur.execute(sql, params or ())
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+
+    def execute(self, sql, params=None):
+        if self._frappe:
+            frappe.db.sql(sql, params or ())
+            return
+        cur = self._pymysql.cursor()
+        cur.execute(sql, params or ())
+        cur.close()
+        self._pymysql.commit()
 
 
-def _is_hidden(rel_path: Path) -> bool:
-    return any(p.startswith(".") for p in rel_path.parts)
+# ---------------------------------------------------------------------------
+# Storage root resolution
+# ---------------------------------------------------------------------------
 
 
-def _walk_disk() -> dict[Path, Path]:
-    """Index every file on disk keyed by its relative path (excluding hidden)."""
+def resolve_storage_root(conn=None, site_dir: Path | None = None):
+    """Pick the storage root that actually holds Drive files."""
+    global SITE_FOLDER
+    db = _DB(conn)
+
+    if site_dir is not None:
+        private = site_dir / "private" / "files"
+        public = site_dir / "files"
+    else:
+        private = Path(frappe.get_site_path("private/files"))
+        public = Path(frappe.get_site_path("files"))
+
+    row = db.fetchone(
+        "SELECT path FROM `tabDrive File` WHERE parent_entity IS NULL AND is_active = 1 LIMIT 1"
+    )
+    probe = (row[0].rstrip("/") if row and row[0] else "") or None
+
+    if probe:
+        if (public / probe).is_dir():
+            SITE_FOLDER = public
+            log(f"storage root : PUBLIC files/  ({public})")
+            return
+        if (private / probe).is_dir():
+            SITE_FOLDER = private
+            log(f"storage root : PRIVATE files/ ({private})")
+            return
+    SITE_FOLDER = private
+    log(f"storage root : defaulted to {private}")
+    return
+
+
+# ---------------------------------------------------------------------------
+# Disk index
+# ---------------------------------------------------------------------------
+
+
+def walk_disk() -> dict:
     index = {}
     if not SITE_FOLDER.is_dir():
         return index
     for f in SITE_FOLDER.rglob("*"):
         if f.is_file():
             rel = f.relative_to(SITE_FOLDER)
-            if not _is_hidden(rel):
+            if not any(p.startswith(".") for p in rel.parts):
                 index[rel] = f
     return index
 
 
-def _canonical_path_for(name) -> Path | None:
-    """Recompute canonical path by walking the parent_entity chain to the root folder."""
-    row = frappe.db.get_value(
-        "Drive File", name, ["title", "path", "parent_entity", "is_group"], as_dict=True
+def canonical_path_for(db, name):
+    row = db.fetchone(
+        "SELECT title, path, parent_entity, is_group FROM `tabDrive File` WHERE name = %s",
+        (name,),
     )
     if not row:
         return None
+    title, _, parent, is_group = row
 
     chain = []
-    cur_name = row.parent_entity
+    cur_name = parent
     guard = 0
     while cur_name and guard < 50:
-        p = frappe.db.get_value(
-            "Drive File", cur_name, ["title", "path", "parent_entity", "is_group"], as_dict=True
+        p = db.fetchone(
+            "SELECT title, path, parent_entity, is_group FROM `tabDrive File` WHERE name = %s",
+            (cur_name,),
         )
         if not p:
             break
         chain.append(p)
-        if cint(p.is_group) == 0 or not p.parent_entity:
+        if not p[3] or not p[2]:  # not a group, or no parent -> root
             break
-        cur_name = p.parent_entity
+        cur_name = p[2]
         guard += 1
     if not chain:
         return None
 
     chain.reverse()
-    root = chain[0]
-    base = (root["path"] or "").rstrip("/")
-    if not base:
+    root_path = (chain[0][1] or "").rstrip("/")
+    if not root_path:
         return None
-    parts = [r["title"] for r in chain[1:]] + [row["title"]]
-    return Path(base) / Path(*parts)
+    parts = [r[0] for r in chain[1:]] + [title]
+    return str(Path(root_path) / Path(*parts))
 
 
-def _score_path(candidate: Path, chain_titles: list[str]) -> int:
-    """Score how well a candidate path matches the canonical folder chain."""
-    cand_parts = {p for p in candidate.parts}
-    return sum(1 for t in chain_titles if t in cand_parts)
+def team_of_parent(db, name):
+    row = db.fetchone("SELECT parent_entity FROM `tabDrive File` WHERE name = %s", (name,))
+    if not row or not row[0]:
+        return None
+    p = db.fetchone("SELECT team FROM `tabDrive File` WHERE name = %s", (row[0],))
+    return p[0] if p else None
 
 
-def _find_best_on_disk(disk_index: dict[Path, Path], canonical: Path, title: str):
-    """Locate a single best match for title on disk, or None if ambiguous."""
+def score_path(candidate: Path, chain_titles: set) -> int:
+    parts = set(candidate.parts)
+    return sum(1 for t in chain_titles if t in parts)
+
+
+def find_best_on_disk(disk_index, canonical: Path, title: str):
     matches = [rel for rel in disk_index if rel.name == title]
     if not matches:
         return None
     if len(matches) == 1:
         return matches[0]
-
-    chain_titles = [p for p in canonical.parts[:-1]]
-    scored = sorted(matches, key=lambda m: (_score_path(m, chain_titles), len(m.parts)), reverse=True)
-    if _score_path(scored[0], chain_titles) > _score_path(scored[1], chain_titles):
+    canonical = Path(canonical)
+    chain_titles = set(canonical.parts[:-1])
+    scored = sorted(
+        matches,
+        key=lambda m: (score_path(m, chain_titles), len(m.parts)),
+        reverse=True,
+    )
+    if score_path(scored[0], chain_titles) > score_path(scored[1], chain_titles):
         return scored[0]
     return None
 
 
-def _team_of_parent(name) -> str | None:
-    parent = frappe.db.get_value("Drive File", name, "parent_entity")
-    if parent:
-        return frappe.db.get_value("Drive File", parent, "team")
-    return None
-
-
-def _move_file(src_rel: Path, canonical: Path) -> None:
-    """Move a file on disk to its canonical location, creating parent dirs."""
-    src = SITE_FOLDER / src_rel
-    dst = SITE_FOLDER / canonical
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    if dst.exists():
-        frappe.log_error(
-            message=f"Repair: destination exists, skipping move {src_rel} -> {canonical}",
-            title="Drive Path Drift Repair",
-        )
-        return
-    shutil.move(str(src), str(dst))
-
-
-def _restore_from_trash(team: str, canonical: Path) -> bool:
-    """Restore a file from the team's .trash to the canonical location."""
-    root = get_home_folder(team)
-    trash_dir = SITE_FOLDER / root["path"] / ".trash"
+def restore_from_trash(db, team, canonical: Path) -> bool:
+    root_rows = db.fetchall(
+        "SELECT path FROM `tabDrive File` WHERE team = %s AND parent_entity IS NULL LIMIT 1",
+        (team,),
+    )
+    if not root_rows:
+        return False
+    trash_dir = SITE_FOLDER / root_rows[0][0] / ".trash"
     if not trash_dir.is_dir():
         return False
+    canonical = Path(canonical)
     for f in trash_dir.rglob("*"):
         if f.is_file() and f.name == canonical.name:
             dst = SITE_FOLDER / canonical
@@ -152,114 +215,197 @@ def _restore_from_trash(team: str, canonical: Path) -> bool:
     return False
 
 
-def run(dry_run=False):
-    """Audit + repair every active non-group Drive File."""
-    dry_run = bool(cint(dry_run))
-    mgr = FileManager()
-    disk_index = _walk_disk()
+# ---------------------------------------------------------------------------
+# Repair / verify
+# ---------------------------------------------------------------------------
 
-    rows = frappe.get_all("Drive File", filters={"is_active": 1, "is_group": 0}, fields=["name"])
+
+def run(dry_run=False, conn=None, site_dir=None):
+    """Audit + repair every active non-group Drive File."""
+    db = _DB(conn)
+    resolve_storage_root(conn, site_dir)
+    disk_index = walk_disk()
+
+    names = [
+        r[0]
+        for r in db.fetchall(
+            "SELECT name FROM `tabDrive File` WHERE is_active = 1 AND is_group = 0"
+        )
+    ]
 
     stats = {"ok": 0, "path_fixed": 0, "moved": 0, "restored": 0, "team_fixed": 0, "missing": 0}
     report = []
 
-    log(f"START audit | active non-group files: {len(rows)} | dry_run={dry_run} | disk_index={len(disk_index)}")
+    log(f"START | active non-group files: {len(names)} | dry_run={bool(dry_run)} | disk_index={len(disk_index)}")
 
-    for r in rows:
-        name = r["name"]
-        row = frappe.db.get_value(
-            "Drive File", name, ["title", "path", "parent_entity", "team"], as_dict=True
-        )
+    for name in names:
+        row = db.fetchone("SELECT title, path, team FROM `tabDrive File` WHERE name = %s", (name,))
         if not row:
-            log(f"SKIP {name}: record vanished")
             continue
+        title, cur_path, team = row
 
-        canonical = _canonical_path_for(name)
+        canonical = canonical_path_for(db, name)
 
-        # 1. Team mismatch repair (DB tree is source of truth)
-        parent_team = _team_of_parent(name)
-        if parent_team and parent_team != row.team:
-            report.append(f"team-fix   {name}  {row.team} -> {parent_team}")
+        # 1. Team mismatch (DB tree is source of truth)
+        pt = team_of_parent(db, name)
+        if pt and pt != team:
+            report.append(f"team-fix  {name}  {team} -> {pt}")
             if not dry_run:
-                frappe.db.set_value("Drive File", name, "team", parent_team)
-                log(f"FIXED team {name}: {row.team} -> {parent_team}")
+                db.execute("UPDATE `tabDrive File` SET team = %s WHERE name = %s", (pt, name))
+                log(f"FIXED team {name}: {team} -> {pt}")
             stats["team_fixed"] += 1
 
         # 2. Path checks
-        current = (row.path or "").rstrip("/")
+        current = (cur_path or "").rstrip("/")
         if canonical is None:
-            report.append(f"missing    {name}  (no canonical path)")
+            report.append(f"missing   {name}  (no canonical path)")
             stats["missing"] += 1
             log(f"MISSING {name}: cannot compute canonical path")
             continue
 
-        canonical_str = str(canonical)
-        if current == canonical_str.rstrip("/"):
+        canonical_str = str(canonical).rstrip("/")
+        canonical_abs = SITE_FOLDER / canonical
+
+        # OK only if DB path AND disk agree. If missing at canonical, fall
+        # through to disk search / restore.
+        if current == canonical_str and canonical_abs.is_file():
             stats["ok"] += 1
             continue
 
-        canonical_full = SITE_FOLDER / canonical
-        if canonical_full.is_file():
-            report.append(f"path-fix   {name}  {current} -> {canonical_str}")
+        if canonical_abs.is_file():
+            report.append(f"path-fix  {name}  {current} -> {canonical_str}")
             if not dry_run:
-                frappe.db.set_value("Drive File", name, "path", canonical_str)
+                db.execute("UPDATE `tabDrive File` SET path = %s WHERE name = %s", (canonical_str, name))
                 log(f"FIXED path {name}: {current} -> {canonical_str}")
             stats["path_fixed"] += 1
             continue
 
-        match = _find_best_on_disk(disk_index, canonical, row["title"])
+        match = find_best_on_disk(disk_index, canonical, title)
         if match is not None:
-            report.append(f"move       {name}  {match} -> {canonical_str}")
+            report.append(f"move      {name}  {match} -> {canonical_str}")
             if not dry_run:
-                _move_file(match, canonical)
-                frappe.db.set_value("Drive File", name, "path", canonical_str)
+                dst = SITE_FOLDER / canonical
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if not dst.exists():
+                    shutil.move(str(SITE_FOLDER / match), str(dst))
+                db.execute("UPDATE `tabDrive File` SET path = %s WHERE name = %s", (canonical_str, name))
                 log(f"MOVED {name}: {match} -> {canonical_str}")
             stats["moved"] += 1
             continue
 
-        if _restore_from_trash(row.team, canonical):
-            report.append(f"restore    {name}  (.trash) -> {canonical_str}")
+        if restore_from_trash(db, team, canonical):
+            report.append(f"restore   {name}  (.trash) -> {canonical_str}")
             if not dry_run:
-                frappe.db.set_value("Drive File", name, "path", canonical_str)
+                db.execute("UPDATE `tabDrive File` SET path = %s WHERE name = %s", (canonical_str, name))
                 log(f"RESTORED {name}: .trash -> {canonical_str}")
             stats["restored"] += 1
             continue
 
-        report.append(f"missing    {name}  {row['title']}  (no copy found)")
+        report.append(f"missing   {name}  {title}  (no copy found)")
         stats["missing"] += 1
-        log(f"MISSING {name} ({row['title']}): no copy found on disk or trash")
+        log(f"MISSING {name} ({title}): no copy found on disk or trash")
 
-    if not dry_run:
-        frappe.db.commit()
-
-    print("=" * 80)
-    print(f"Drive Path Drift Repair  (dry_run={dry_run})")
     print("=" * 80)
     for line in report:
         print(line)
-    print("-" * 80)
-    print(
+    print("=" * 80)
+    log(
         f"ok={stats['ok']} path_fixed={stats['path_fixed']} moved={stats['moved']} "
-        f"restored={stats['restored']} team_fixed={stats['team_fixed']} missing={stats['missing']}"
+        f"restored={stats['restored']} team_fixed={stats['team_fixed']} missing={stats['missing']} "
+        f"| TOTAL: {len(names)}"
     )
-    print(f"TOTAL: {len(rows)} active non-group files")
     return stats
 
 
-def verify():
-    """Verify every active non-group file downloads after repair."""
-    mgr = FileManager()
-    rows = frappe.get_all("Drive File", filters={"is_active": 1, "is_group": 0}, fields=["name"])
+def verify(conn=None, site_dir=None):
+    """Check every active non-group file exists on disk."""
+    db = _DB(conn)
+    resolve_storage_root(conn, site_dir)
+
+    rows = db.fetchall(
+        "SELECT name, path FROM `tabDrive File` WHERE is_active = 1 AND is_group = 0"
+    )
+    total = len(rows)
     fail = 0
-    log(f"VERIFY start | total files: {len(rows)}")
-    for r in rows:
-        try:
-            buf = mgr.get_file(frappe.get_doc("Drive File", r["name"]))
-            log(f"VERIFY ok   {r['name']} | {len(buf.getvalue())} bytes")
-        except Exception as e:
+    for name, path in rows:
+        fp = SITE_FOLDER / (path or "")
+        if not fp.is_file():
             fail += 1
-            log(f"VERIFY FAIL {r['name']} | {e}")
-            print("FAIL:", r["name"], e)
-    log(f"VERIFY done | total={len(rows)} failures={fail}")
-    print(f"Total active: {len(rows)}, Failures: {fail}")
-    return {"total": len(rows), "failures": fail}
+            log(f"VERIFY FAIL {name}  path='{path}'  NOT on disk")
+    log(f"VERIFY done | total={total} failures={fail}")
+    return {"total": total, "failures": fail}
+
+
+# ---------------------------------------------------------------------------
+# Logging helper
+# ---------------------------------------------------------------------------
+
+SITE_FOLDER = None
+
+DEBUG = True
+
+
+def log(msg):
+    line = f"[drive-repair] {msg}"
+    print(line)
+    if DEBUG:
+        try:
+            frappe.logger().info(line)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Standalone entry (when run as a script)
+# ---------------------------------------------------------------------------
+
+
+def _standalone_connect(site_dir: Path):
+    import json
+
+    import pymysql
+
+    with open(site_dir / "site_config.json") as f:
+        conf = json.load(f)
+    return pymysql.connect(
+        host=conf.get("db_host") or "127.0.0.1",
+        port=int(conf.get("db_port") or 3306),
+        user=conf.get("db_name"),
+        password=conf.get("db_password"),
+        database=conf.get("db_name"),
+        autocommit=False,
+        charset="utf8mb4",
+    )
+
+
+def _main():
+    parser = argparse.ArgumentParser(description="Reusable Drive path repair patch")
+    parser.add_argument("--site", help="Site name, e.g. astromindev.nvi.frappe.cloud")
+    parser.add_argument("--bench-dir", default=None, help="Path to frappe-bench root (auto-detect if omitted)")
+    group = parser.add_argument_group("actions")
+    group.add_argument("--dry-run", action="store_true", help="Audit only, no changes (default)")
+    group.add_argument("--apply", action="store_true", help="Apply repairs (moves files + updates DB)")
+    group.add_argument("--verify", action="store_true", help="Check every file exists on disk")
+    args = parser.parse_args()
+
+    site = args.site
+    if not site:
+        sys.exit("ERROR: --site is required when running standalone (or run via bench execute)")
+
+    bench_root = Path(args.bench_dir or Path.home() / "frappe-bench")
+    site_dir = bench_root / "sites" / site
+    if not (site_dir / "site_config.json").is_file():
+        sys.exit(f"ERROR: no site_config.json at {site_dir}")
+
+    conn = _standalone_connect(site_dir)
+    try:
+        if args.verify:
+            verify(conn=conn, site_dir=site_dir)
+        else:
+            run(dry_run=not args.apply, conn=conn, site_dir=site_dir)
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    _main()
