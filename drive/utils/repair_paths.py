@@ -40,7 +40,7 @@ def log(msg):
     if DEBUG:
         frappe.logger().info(line)
 
-SITE_FOLDER = Path(frappe.get_site_path("private/files"))
+SITE_FOLDER = FileManager().site_folder
 SKIP_PARTS = {".trash", ".thumbnails", ".embeds"}
 
 

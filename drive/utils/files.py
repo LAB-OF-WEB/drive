@@ -35,7 +35,7 @@ class FileManager:
         self.s3_enabled = settings.enabled
         self.flat = settings.flat
         self.bucket = settings.bucket
-        self.site_folder = Path(frappe.get_site_path("private/files"))
+        self.site_folder = self._resolve_site_folder()
 
         TEAMS = frappe.get_all("Drive Team", fields=["name", "s3_bucket", "prefix"])
         self.bucket_map = {k["name"]: k["s3_bucket"] for k in TEAMS}
@@ -64,6 +64,41 @@ class FileManager:
             return func(self, *args, **kwargs)
 
         return wrapper
+
+    def _resolve_site_folder(self):
+        """
+        Resolve the on-disk storage root for Drive files.
+
+        Drive normally stores files under ``<site>/private/files``, but some
+        sites (e.g. restored/imported or legacy setups) keep the data under
+        the public ``<site>/files`` directory instead. The DB ``path`` values
+        are relative to whichever root was in use at upload time, so we probe
+        a real home-folder path from the DB against both roots and pick the
+        one that actually contains it. Falls back to ``private/files``.
+        """
+        private = Path(frappe.get_site_path("private/files"))
+        public = Path(frappe.get_site_path("files"))
+
+        # Probe with a genuine home-folder path so we agree with the DB.
+        DriveFile = frappe.qb.DocType("Drive File")
+        rows = (
+            frappe.qb.from_(DriveFile)
+            .select(DriveFile.path)
+            .where(DriveFile.parent_entity.isnull())
+            .where(DriveFile.is_active == 1)
+            .limit(1)
+            .run(as_dict=True)
+        )
+        probe = ((rows[0]["path"] if rows else "") or "").rstrip("/")
+        if probe:
+            if (public / probe).is_dir():
+                print(f"[drive:files] storage root resolved to PUBLIC files/ ({public})")
+                return public
+            if (private / probe).is_dir():
+                print(f"[drive:files] storage root resolved to PRIVATE files/ ({private})")
+                return private
+        print(f"[drive:files] storage root defaulted to {private}")
+        return private
 
     def get_bucket(self, team):
         return self.bucket_map.get(team) or self.bucket
