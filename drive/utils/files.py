@@ -218,14 +218,24 @@ class FileManager:
         try:
             with open(self.site_folder / entity.path, "rb") as fh:
                 buf = BytesIO(fh.read())
+            print(f"[drive:get_file] OK {entity.name} ({entity.title}) path='{entity.path}'")
         except (FileNotFoundError, TypeError, OSError):
             # Path drift self-heal: a file may have been moved/renamed on disk
             # without its Drive File path being updated (or vice versa). Fall
             # back to the canonical path derived from the folder tree, and
             # repair the record so subsequent downloads resolve directly.
+            print(
+                f"[drive:get_file] DRIFT {entity.name} ({entity.title}) stored='{entity.path}' not found "
+                f"at {self.site_folder / entity.path}"
+            )
             canonical = self._canonical_disk_path(entity)
             if not canonical or not (self.site_folder / canonical).is_file():
+                print(
+                    f"[drive:get_file] RECOVERY-FAILED {entity.name} canonical={canonical} "
+                    f"exists={bool(canonical and (self.site_folder / canonical).is_file())}"
+                )
                 frappe.throw("Could not find this file", frappe.NotFound)
+            print(f"[drive:get_file] RECOVERED {entity.name} canonical='{canonical}'")
             frappe.log_error(
                 message=(
                     f"Drive File {entity.name} ({entity.title}) not found at "

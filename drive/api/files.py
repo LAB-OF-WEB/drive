@@ -593,6 +593,11 @@ def get_file_content(entity_name, trigger_download=0, jwt_token=None, transfer=F
     if not drive_file or drive_file.is_group or drive_file.is_link or (not transfer and drive_file.is_active != 1):
         frappe.throw("Not found", frappe.NotFound)
 
+    print(
+        f"[drive:get_file_content] entity={entity_name} title={drive_file.title} "
+        f"path='{drive_file.get('path')}' team={drive_file.team}"
+    )
+
     return get_file_internal(drive_file, trigger_download)
 
 

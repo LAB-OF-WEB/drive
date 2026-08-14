@@ -45,6 +45,8 @@ class DriveFile(Document):
         Detect and fix parent/child path inconsistencies before saving.
         """
         if not self.is_active or self.is_link or self.mime_type == "frappe/slides":
+            print(f"[drive:validate] SKIP {self.name} ({self.title}) is_active={self.is_active} "
+                  f"is_link={self.is_link} mime={self.mime_type}")
             return
 
         if not self.parent_entity:
@@ -54,6 +56,8 @@ class DriveFile(Document):
         current = (self.path or "").rstrip("/")
 
         if current != expected and expected:
+            print(f"[drive:validate] DRIFT {self.name} ({self.title}) current='{self.path}' "
+                  f"expected='{expected}' -> repairing")
             frappe.log_error(
                 message=(
                     f"Drive File path drift detected for {self.name} ({self.title}).\n"
@@ -63,6 +67,8 @@ class DriveFile(Document):
                 title="Drive Path Drift",
             )
             self.path = expected
+        else:
+            print(f"[drive:validate] OK {self.name} ({self.title}) path='{self.path}' matches expected")
 
     def on_trash(self):
         frappe.db.delete("Drive Favourite", {"entity": self.name})
