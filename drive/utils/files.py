@@ -223,12 +223,16 @@ class FileManager:
             # Path drift self-heal: a file may have been moved/renamed on disk
             # without its Drive File path being updated (or vice versa). Fall
             # back to the canonical path derived from the folder tree, and
-            # repair the record so subsequent downloads resolve directly.
+            # repair the record so subsequent downloads resolve directly. If
+            # the file is not at its canonical location either, search the
+            # disk by name and relocate it there (dynamic repair).
             print(
                 f"[drive:get_file] DRIFT {entity.name} ({entity.title}) stored='{entity.path}' not found "
                 f"at {self.site_folder / entity.path}"
             )
             canonical = self._canonical_disk_path(entity)
+            if not canonical or not (self.site_folder / canonical).is_file():
+                canonical = self._relocate_mislocated_file(entity, canonical)
             if not canonical or not (self.site_folder / canonical).is_file():
                 print(
                     f"[drive:get_file] RECOVERY-FAILED {entity.name} canonical={canonical} "
@@ -248,6 +252,51 @@ class FileManager:
                 buf = BytesIO(fh.read())
 
         return buf
+
+    def _relocate_mislocated_file(self, entity, canonical):
+        """
+        Dynamic repair: the file is not at its canonical path, so search the
+        disk for a file whose name matches this entity's title, score the
+        candidates against the canonical folder chain, and move the best match
+        to the canonical location. Returns the repaired canonical path (or None
+        if no usable copy is found).
+        """
+        if self.flat:
+            return None
+        if not canonical:
+            return None
+
+        title = entity.title
+        chain_titles = {p for p in canonical.parts[:-1]}
+        best = None
+        best_score = -1
+        best_leaf = None
+        for path in self.site_folder.rglob("*"):
+            if not path.is_file():
+                continue
+            if any(p.startswith(".") for p in path.parts):
+                continue
+            if path.name == title:
+                leaf = path.relative_to(self.site_folder)
+                score = sum(1 for p in leaf.parts if p in chain_titles)
+                # Prefer the shallowest match as a tie-breaker
+                if score > best_score or (score == best_score and (best is None or len(leaf.parts) < len(best_leaf))):
+                    best = path
+                    best_score = score
+                    best_leaf = leaf
+
+        if best is None:
+            return None
+
+        print(
+            f"[drive:get_file] RELOCATING {entity.name} '{title}' from '{best_leaf}' -> '{canonical}'"
+        )
+        dst = self.site_folder / canonical
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists():
+            return canonical
+        shutil.move(str(best), str(dst))
+        return canonical
 
     def _get_file_s3(self, entity, range_header=None):
         if range_header:
