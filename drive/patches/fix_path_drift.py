@@ -8,8 +8,13 @@ using the DB folder tree as the single source of truth. Runs automatically on
 The runtime path-drift guard (in drive/utils/files.py and drive_file.py) stays
 as the scheduled/defensive job; this patch repairs historical data one time.
 
-It NEVER deletes anything. Run `drive.utils.repair_paths.run` with dry_run=True
-first if you want to review the plan on a live site before migrating.
+It NEVER deletes anything. Review the plan on a live site first with:
+
+    bench --site YOUR_SITE execute drive.utils.repair_paths.audit
+
+IMPORTANT: This patch must NEVER abort `bench migrate`. Any per-file problem is
+handled inside the repair engine; unexpected top-level errors are logged here
+and swallowed so the migration always continues.
 """
 
 import frappe
@@ -18,11 +23,23 @@ from drive.utils.repair_paths import run
 
 
 def execute():
-    stats = run(dry_run=False)
-    if stats["missing"]:
+    try:
+        stats = run(dry_run=False)
+        if stats.get("missing"):
+            frappe.log_error(
+                f"Drive path repair: {stats['missing']} file(s) had no copy on disk "
+                "and need to be re-uploaded",
+                title="Drive Path Repair",
+            )
+        if stats.get("ambiguous"):
+            frappe.log_error(
+                f"Drive path repair: {stats['ambiguous']} file(s) had a same-named "
+                "off-branch file and were NOT auto-moved (review manually)",
+                title="Drive Path Repair",
+            )
+    except Exception as e:
         frappe.log_error(
-            f"Drive path repair: {stats['missing']} file(s) had no copy on disk "
-            "and need to be re-uploaded",
+            f"Drive path repair aborted with an unexpected error: {e!r}",
             title="Drive Path Repair",
         )
     frappe.db.commit()

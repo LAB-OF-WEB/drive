@@ -28,6 +28,7 @@ It NEVER deletes anything. Run with dry_run=True first to review the plan.
 """
 
 import argparse
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -74,6 +75,12 @@ class _DB:
         cur.execute(sql, params or ())
         cur.close()
         self._pymysql.commit()
+
+    def commit(self):
+        if self._frappe:
+            frappe.db.commit()
+        else:
+            self._pymysql.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -177,14 +184,38 @@ def score_path(candidate: Path, chain_titles: set) -> int:
     return sum(1 for t in chain_titles if t in parts)
 
 
+def _normalize(part: str) -> str:
+    """Normalize a path component for fuzzy matching (ignores case, spaces,
+    hyphens, underscores). 'AMG-ACCOUNTS' and 'AMG_ACCOUNTS' both -> 'amgaccounts'."""
+    return re.sub(r"[^a-z0-9]", "", part.lower())
+
+
+def same_branch(canonical: Path, candidate: Path) -> bool:
+    """True if the candidate's folder chain is on the same branch as the canonical
+    path (fuzzy). Guards against cross-tree false matches where a file with the
+    same title exists under a totally different folder tree (e.g. AMG_MANAGEMENT
+    vs AMG-ACCOUNTS). The canonical parent components must appear, in order, as
+    a subsequence of the candidate's parent components."""
+    canon_parents = [_normalize(p) for p in canonical.parts[:-1]]
+    cand_parts = [_normalize(p) for p in candidate.parts]
+    if not canon_parents:
+        return True
+    it = iter(cand_parts)
+    for cp in canon_parents:
+        if cp not in it:
+            return False
+    return True
+
+
 def find_best_on_disk(disk_index, canonical: Path, title: str):
-    matches = [rel for rel in disk_index if rel.name == title]
+    """Find the best same-branch candidate on disk. Never matches cross-tree."""
+    canonical = Path(canonical)
+    matches = [rel for rel in disk_index if rel.name == title and same_branch(canonical, rel)]
     if not matches:
         return None
     if len(matches) == 1:
         return matches[0]
-    canonical = Path(canonical)
-    chain_titles = set(canonical.parts[:-1])
+    chain_titles = {_normalize(p) for p in canonical.parts[:-1]}
     scored = sorted(
         matches,
         key=lambda m: (score_path(m, chain_titles), len(m.parts)),
@@ -210,7 +241,8 @@ def restore_from_trash(db, team, canonical: Path) -> bool:
         if f.is_file() and f.name == canonical.name:
             dst = SITE_FOLDER / canonical
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(f), str(dst))
+            if not dst.exists():
+                shutil.move(str(f), str(dst))
             return True
     return False
 
@@ -220,8 +252,34 @@ def restore_from_trash(db, team, canonical: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _move_to_canonical(disk_index, db, name, source, canonical_str, stats):
+    """Move a single on-disk file to its canonical location and fix the DB row.
+    Never raises on a missing source - returns False so the caller can report it."""
+    src = SITE_FOLDER / source
+    if not src.is_file():
+        return False
+    dst = SITE_FOLDER / Path(canonical_str)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if not dst.exists():
+        shutil.move(str(src), str(dst))
+    db.execute("UPDATE `tabDrive File` SET path = %s WHERE name = %s", (canonical_str, name))
+    db.commit()
+    # Remove the consumed source from the disk index so another record can't
+    # claim the same file after we moved it.
+    disk_index.pop(source, None)
+    return True
+
+
 def run(dry_run=False, conn=None, site_dir=None):
-    """Audit + repair every active non-group Drive File."""
+    """Audit + repair every active non-group Drive File.
+
+    Safety rules:
+      - DB folder tree is the single source of truth.
+      - A file is only moved from THIS record's own stored path, or from a
+        same-branch disk match (never a cross-tree filename match).
+      - One bad record never aborts the whole run (per-record try/except).
+      - Never deletes anything.
+    """
     db = _DB(conn)
     resolve_storage_root(conn, site_dir)
     disk_index = walk_disk()
@@ -233,77 +291,121 @@ def run(dry_run=False, conn=None, site_dir=None):
         )
     ]
 
-    stats = {"ok": 0, "path_fixed": 0, "moved": 0, "restored": 0, "team_fixed": 0, "missing": 0}
+    stats = {
+        "ok": 0,
+        "path_fixed": 0,
+        "moved": 0,
+        "restored": 0,
+        "team_fixed": 0,
+        "ambiguous": 0,
+        "missing": 0,
+        "errors": 0,
+    }
     report = []
 
     log(f"START | active non-group files: {len(names)} | dry_run={bool(dry_run)} | disk_index={len(disk_index)}")
 
     for name in names:
-        row = db.fetchone("SELECT title, path, team FROM `tabDrive File` WHERE name = %s", (name,))
-        if not row:
-            continue
-        title, cur_path, team = row
+        try:
+            row = db.fetchone("SELECT title, path, team FROM `tabDrive File` WHERE name = %s", (name,))
+            if not row:
+                continue
+            title, cur_path, team = row
 
-        canonical = canonical_path_for(db, name)
+            canonical = canonical_path_for(db, name)
 
-        # 1. Team mismatch (DB tree is source of truth)
-        pt = team_of_parent(db, name)
-        if pt and pt != team:
-            report.append(f"team-fix  {name}  {team} -> {pt}")
-            if not dry_run:
-                db.execute("UPDATE `tabDrive File` SET team = %s WHERE name = %s", (pt, name))
-                log(f"FIXED team {name}: {team} -> {pt}")
-            stats["team_fixed"] += 1
+            # 1. Team mismatch (DB tree is source of truth)
+            pt = team_of_parent(db, name)
+            if pt and pt != team:
+                report.append(f"team-fix  {name}  {team} -> {pt}")
+                if not dry_run:
+                    db.execute("UPDATE `tabDrive File` SET team = %s WHERE name = %s", (pt, name))
+                    db.commit()
+                    log(f"FIXED team {name}: {team} -> {pt}")
+                stats["team_fixed"] += 1
 
-        # 2. Path checks
-        current = (cur_path or "").rstrip("/")
-        if canonical is None:
-            report.append(f"missing   {name}  (no canonical path)")
+            # 2. Path checks
+            current = (cur_path or "").rstrip("/")
+            if canonical is None:
+                report.append(f"missing   {name}  (no canonical path)")
+                stats["missing"] += 1
+                log(f"MISSING {name}: cannot compute canonical path")
+                continue
+
+            canonical_str = str(canonical).rstrip("/")
+            canonical_abs = SITE_FOLDER / canonical
+
+            # OK only if DB path AND disk agree. If missing at canonical, fall
+            # through to disk search / restore.
+            if current == canonical_str and canonical_abs.is_file():
+                stats["ok"] += 1
+                continue
+
+            if canonical_abs.is_file():
+                report.append(f"path-fix  {name}  {current} -> {canonical_str}")
+                if not dry_run:
+                    db.execute("UPDATE `tabDrive File` SET path = %s WHERE name = %s", (canonical_str, name))
+                    db.commit()
+                    log(f"FIXED path {name}: {current} -> {canonical_str}")
+                stats["path_fixed"] += 1
+                continue
+
+            # 3. Move - ONLY from this record's own stored path (safe source) or a
+            #    same-branch disk match. Never a cross-tree filename match.
+            source = None
+            source_label = None
+            if current and (SITE_FOLDER / current).is_file():
+                source = current
+                source_label = current
+            else:
+                match = find_best_on_disk(disk_index, canonical, title)
+                if match is not None:
+                    source = match
+                    source_label = str(match)
+
+            if source is not None:
+                if dry_run:
+                    report.append(f"move      {name}  {source_label} -> {canonical_str}")
+                    stats["moved"] += 1
+                else:
+                    if _move_to_canonical(disk_index, db, name, source, canonical_str, stats):
+                        report.append(f"move      {name}  {source_label} -> {canonical_str}")
+                        log(f"MOVED {name}: {source_label} -> {canonical_str}")
+                        stats["moved"] += 1
+                    else:
+                        # source vanished mid-run (consumed by an earlier record)
+                        report.append(f"missing   {name}  {title}  (source vanished)")
+                        stats["missing"] += 1
+                        log(f"MISSING {name} ({title}): source {source_label} no longer on disk")
+                continue
+
+            # 4. Restore from team trash
+            if restore_from_trash(db, team, canonical):
+                report.append(f"restore   {name}  (.trash) -> {canonical_str}")
+                if not dry_run:
+                    db.execute("UPDATE `tabDrive File` SET path = %s WHERE name = %s", (canonical_str, name))
+                    db.commit()
+                    log(f"RESTORED {name}: .trash -> {canonical_str}")
+                stats["restored"] += 1
+                continue
+
+            # 5. Any same-named file exists but NOT on this branch? Flag as ambiguous
+            #    (never auto-move a possibly-different file across trees).
+            elsewhere = [rel for rel in disk_index if rel.name == title and not same_branch(canonical, rel)]
+            if elsewhere:
+                report.append(f"ambiguous {name}  {title}  (same name off-branch: {elsewhere[0]})")
+                stats["ambiguous"] += 1
+                log(f"AMBIGUOUS {name} ({title}): off-branch file {elsewhere[0]} not auto-moved")
+                continue
+
+            report.append(f"missing   {name}  {title}  (no copy found)")
             stats["missing"] += 1
-            log(f"MISSING {name}: cannot compute canonical path")
+            log(f"MISSING {name} ({title}): no copy found on disk or trash")
+        except Exception as e:
+            stats["errors"] += 1
+            report.append(f"error     {name}  {e!r}")
+            log(f"ERROR {name}: {e!r}")
             continue
-
-        canonical_str = str(canonical).rstrip("/")
-        canonical_abs = SITE_FOLDER / canonical
-
-        # OK only if DB path AND disk agree. If missing at canonical, fall
-        # through to disk search / restore.
-        if current == canonical_str and canonical_abs.is_file():
-            stats["ok"] += 1
-            continue
-
-        if canonical_abs.is_file():
-            report.append(f"path-fix  {name}  {current} -> {canonical_str}")
-            if not dry_run:
-                db.execute("UPDATE `tabDrive File` SET path = %s WHERE name = %s", (canonical_str, name))
-                log(f"FIXED path {name}: {current} -> {canonical_str}")
-            stats["path_fixed"] += 1
-            continue
-
-        match = find_best_on_disk(disk_index, canonical, title)
-        if match is not None:
-            report.append(f"move      {name}  {match} -> {canonical_str}")
-            if not dry_run:
-                dst = SITE_FOLDER / canonical
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                if not dst.exists():
-                    shutil.move(str(SITE_FOLDER / match), str(dst))
-                db.execute("UPDATE `tabDrive File` SET path = %s WHERE name = %s", (canonical_str, name))
-                log(f"MOVED {name}: {match} -> {canonical_str}")
-            stats["moved"] += 1
-            continue
-
-        if restore_from_trash(db, team, canonical):
-            report.append(f"restore   {name}  (.trash) -> {canonical_str}")
-            if not dry_run:
-                db.execute("UPDATE `tabDrive File` SET path = %s WHERE name = %s", (canonical_str, name))
-                log(f"RESTORED {name}: .trash -> {canonical_str}")
-            stats["restored"] += 1
-            continue
-
-        report.append(f"missing   {name}  {title}  (no copy found)")
-        stats["missing"] += 1
-        log(f"MISSING {name} ({title}): no copy found on disk or trash")
 
     print("=" * 80)
     for line in report:
@@ -311,7 +413,8 @@ def run(dry_run=False, conn=None, site_dir=None):
     print("=" * 80)
     log(
         f"ok={stats['ok']} path_fixed={stats['path_fixed']} moved={stats['moved']} "
-        f"restored={stats['restored']} team_fixed={stats['team_fixed']} missing={stats['missing']} "
+        f"restored={stats['restored']} team_fixed={stats['team_fixed']} "
+        f"ambiguous={stats['ambiguous']} missing={stats['missing']} errors={stats['errors']} "
         f"| TOTAL: {len(names)}"
     )
     return stats
@@ -334,6 +437,11 @@ def verify(conn=None, site_dir=None):
             log(f"VERIFY FAIL {name}  path='{path}'  NOT on disk")
     log(f"VERIFY done | total={total} failures={fail}")
     return {"total": total, "failures": fail}
+
+
+def audit(conn=None, site_dir=None):
+    """Read-only report of what the repair WOULD do (no changes)."""
+    return run(dry_run=True, conn=conn, site_dir=site_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +492,7 @@ def _main():
     parser.add_argument("--bench-dir", default=None, help="Path to frappe-bench root (auto-detect if omitted)")
     group = parser.add_argument_group("actions")
     group.add_argument("--dry-run", action="store_true", help="Audit only, no changes (default)")
+    group.add_argument("--audit", action="store_true", help="Read-only categorized report (no changes)")
     group.add_argument("--apply", action="store_true", help="Apply repairs (moves files + updates DB)")
     group.add_argument("--verify", action="store_true", help="Check every file exists on disk")
     args = parser.parse_args()
@@ -401,6 +510,8 @@ def _main():
     try:
         if args.verify:
             verify(conn=conn, site_dir=site_dir)
+        elif args.audit:
+            audit(conn=conn, site_dir=site_dir)
         else:
             run(dry_run=not args.apply, conn=conn, site_dir=site_dir)
     finally:
