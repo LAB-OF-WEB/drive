@@ -135,7 +135,18 @@ class FileManager:
                 os.remove(current_path)
         else:
             # could break for folders?
-            os.rename(current_path, self.site_folder / drive_file.path)
+            try:
+                os.rename(current_path, self.site_folder / drive_file.path)
+            except OSError as e:
+                # Surface a friendly message for disk-space / IO failures
+                # instead of a cryptic backend traceback.
+                if e.errno == 28:  # ENOSPC - no space left on device
+                    frappe.throw(
+                        "There's not enough storage space on the server to upload this file. "
+                        "Try a smaller file, or ask your administrator to free up space.",
+                        frappe.ValidationError,
+                    )
+                raise
             if drive_file and create_thumbnail and self.can_create_thumbnail(drive_file):
                 frappe.enqueue(
                     self.upload_thumbnail,

@@ -213,8 +213,13 @@ const defaultActions = computed(() => {
           label: __("Download"),
           icon: LucideDownload,
           isEnabled: () => rootEntity.value.allow_download,
-          onClick: () =>
-            entitiesDownload(route.params.team, [rootEntity.value]),
+          onClick: () => {
+            console.log("[Drive][Download] navbar action fired", {
+              team: route.params.team,
+              entity: rootEntity.value,
+            })
+            entitiesDownload(route.params.team, [rootEntity.value])
+          },
         },
         {
           label: __("Copy Link"),
