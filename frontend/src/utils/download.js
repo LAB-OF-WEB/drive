@@ -1,4 +1,5 @@
 import JSZip from "jszip"
+import { ref } from "vue"
 import { toast } from "./toasts"
 import { printDoc } from "./files"
 import emitter from "@/emitter"
@@ -32,20 +33,22 @@ function showDownloadError(error, fallback) {
 // Prevents starting a second download while one is already in progress.
 // Set synchronously (before any async work) so rapid double-clicks cannot
 // race and both begin; cleared in a finally on every download path.
-let downloadInProgress = false
+// Exported as a reactive ref so the UI can render a spinner / disable the
+// download button while a download is running.
+export const downloadInProgress = ref(false)
 function isDownloadInProgress() {
-  if (downloadInProgress) {
+  if (downloadInProgress.value) {
     toast({
       title: "A download is already in progress. Please wait...",
       type: "info",
     })
     return true
   }
-  downloadInProgress = true
+  downloadInProgress.value = true
   return false
 }
 function clearDownloadInProgress() {
-  downloadInProgress = false
+  downloadInProgress.value = false
 }
 
 async function getPdfFromDoc(entity_name) {
@@ -110,6 +113,7 @@ export function entitiesDownload(team, entities, transfer = false) {
       return folderDownload(team, entities[0])
     }
     console.log("[Drive][Download] branch: single file -> blob download")
+    const t = toast(`Downloading "${entities[0].title}"...`)
     const url = `/api/method/drive.api.files.get_file_content?entity_name=${
       entities[0].name
     }&trigger_download=1${transfer ? "&transfer=1" : ""}`
@@ -134,9 +138,11 @@ export function entitiesDownload(team, entities, transfer = false) {
         document.body.appendChild(downloadLink)
         downloadLink.click()
         document.body.removeChild(downloadLink)
+        document.getElementById(t)?.remove()
         clearDownloadInProgress()
       })
       .catch((error) => {
+        document.getElementById(t)?.remove()
         clearDownloadInProgress()
         showDownloadError(
           error,
@@ -159,7 +165,7 @@ export function entitiesDownload(team, entities, transfer = false) {
         return Promise.all(promises)
       })
     } else if (entity.document) {
-      const content = await getPdfFromDoc(entities[0].name)
+      const content = await getPdfFromDoc(entity.name)
       parentFolder.file(entity.title + ".pdf", content)
     } else {
       const fileContent = await get_file_content(entity)
@@ -183,7 +189,7 @@ export function entitiesDownload(team, entities, transfer = false) {
 
       downloadLink.click()
       document.body.removeChild(downloadLink)
-      document.getElementById(t).remove()
+      document.getElementById(t)?.remove()
       clearDownloadInProgress()
     })
     .catch((error) => {
@@ -247,7 +253,7 @@ function temp(team, entity_name, parentZip) {
             return temp(team, entity.name, folder)
           }
           if (entity.document) {
-            getPdfFromDoc(entity.name).then((content) =>
+            return getPdfFromDoc(entity.name).then((content) =>
               parentZip.file(entity.title + ".pdf", content)
             )
           } else {

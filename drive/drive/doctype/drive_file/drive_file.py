@@ -26,19 +26,37 @@ class DriveFile(Document):
         self.repair_path_drift()
 
     def get_canonical_path(self):
-        """Reconstruct the canonical path by walking up the parent_entity chain."""
-        chain = [self.title]
-        p_name = self.parent_entity
-        visited = {self.name} if self.name else set()
-        while p_name and p_name not in visited:
-            visited.add(p_name)
-            p_doc = frappe.db.get_value("Drive File", p_name, ["name", "title", "parent_entity"], as_dict=True)
+        """Reconstruct the canonical path by walking up the parent_entity chain.
+
+        The on-disk path is rooted at the top-level folder's *path* field
+        (e.g. the home folder's path), with each descendant level appended by
+        title. This mirrors drive.utils.repair_paths.canonical_path_for.
+        """
+        chain = []
+        cur_name = self.parent_entity
+        guard = 0
+        while cur_name and guard < 50:
+            p_doc = frappe.db.get_value(
+                "Drive File",
+                cur_name,
+                ["name", "title", "path", "parent_entity", "is_group"],
+                as_dict=True,
+            )
             if not p_doc:
                 break
-            chain.append(p_doc["title"])
-            p_name = p_doc.get("parent_entity")
+            chain.append(p_doc)
+            if not p_doc.get("is_group") or not p_doc.get("parent_entity"):
+                break
+            cur_name = p_doc.get("parent_entity")
+            guard += 1
+        if not chain:
+            return None
         chain.reverse()
-        return "/".join(chain)
+        root_path = (chain[0].get("path") or "").rstrip("/")
+        if not root_path:
+            return None
+        parts = [p["title"] for p in chain[1:]] + [self.title]
+        return str(Path(root_path) / Path(*parts))
 
     def repair_path_drift(self):
         """
@@ -50,6 +68,10 @@ class DriveFile(Document):
             return
 
         if not self.parent_entity:
+            return
+
+        if not self.path:
+            # Path not yet assigned (e.g. brand-new insert); nothing to repair yet.
             return
 
         expected = self.get_canonical_path()
