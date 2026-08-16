@@ -4,9 +4,6 @@ import { toast } from "./toasts"
 import { printDoc } from "./files"
 import emitter from "@/emitter"
 import router from "@/router"
-import html2pdf from "html2pdf.js"
-import editorStyle from "@/components/DocEditor/styles/editor.css?inline"
-import globalStyle from "@/index.css?inline"
 
 // Renders a Drive-themed error toast. Prefers the frappe exception message
 // (error.messages[0]) and falls back to a friendly message for network /
@@ -19,12 +16,12 @@ function showDownloadError(error, fallback) {
   } else if (raw) {
     message = raw
   }
-  if (/failed to fetch|networkerror|load failed|offline|aborted/i.test(raw)) {
-    message = "You're offline. Check your internet connection and try again."
-  } else if (/^5\d\d\b|internal server|service unavailable/i.test(raw)) {
+  if (error?.status >= 500 || /^5\d\d\b|internal server|service unavailable/i.test(raw)) {
     message = "Something went wrong on the server. Please try again later."
-  } else if (/^4\d\d\b/i.test(raw)) {
+  } else if (error?.status >= 400 || /^4\d\d\b/i.test(raw)) {
     message = "That file isn't available anymore. It may have been moved or deleted."
+  } else if (/failed to fetch|networkerror|load failed|offline|aborted/i.test(raw)) {
+    message = "You're offline. Check your internet connection and try again."
   }
   console.error("[Drive][Download] error:", error)
   toast({ title: message, type: "error" })
@@ -51,30 +48,6 @@ function clearDownloadInProgress() {
   downloadInProgress.value = false
 }
 
-async function getPdfFromDoc(entity_name) {
-  const res = await fetch(
-    `/api/method/drive.api.files.get_file_content?entity_name=${entity_name}`
-  )
-  const raw_html = (await res.json()).message
-  const content = `
-          <!DOCTYPE html>
-          <html>
-            <head>
-              <style>${globalStyle}</style>
-              <style>${editorStyle}</style>
-            </head>
-            <body>
-              <div class="ProseMirror prose-sm" style='padding-left: 40px; padding-right: 40px; padding-top: 20px; padding-bottom: 20px; margin: 0;'>
-                ${raw_html}
-              </div>
-            </body>
-          </html>
-        `
-
-  const pdfBlob = html2pdf().from(content).toPdf()
-  await pdfBlob
-  return pdfBlob.prop.pdf.output("arraybuffer")
-}
 export function entitiesDownload(team, entities, transfer = false) {
   console.log("[Drive][Download] entitiesDownload entry", {
     team,
@@ -111,6 +84,14 @@ export function entitiesDownload(team, entities, transfer = false) {
     if (entities[0].is_group) {
       console.log("[Drive][Download] branch: single folder -> folderDownload")
       return folderDownload(team, entities[0])
+    }
+    if (entities[0].is_link) {
+      clearDownloadInProgress()
+      toast({
+        title: `"${entities[0].title}" is a link and can't be downloaded directly.`,
+        type: "info",
+      })
+      return
     }
     console.log("[Drive][Download] branch: single file -> blob download")
     const t = toast(`Downloading "${entities[0].title}"...`)
@@ -151,42 +132,114 @@ export function entitiesDownload(team, entities, transfer = false) {
       })
   }
 
+  console.log("[Drive][Download] branch: multi-select -> hybrid zip")
+  return decideDownload(team, entities, "Drive Download " + new Date().getTime())
+}
+
+export function folderDownload(team, root_entity) {
+  console.log("[Drive][Download] folderDownload -> hybrid zip", {
+    team,
+    folder: root_entity.name,
+    title: root_entity.title,
+  })
+  return decideDownload(team, [root_entity], root_entity.title)
+}
+
+// Client-side zipping is fast but buffers every file in browser memory, so it's
+// only safe for small selections. Heavy ones go through the server-side
+// enqueue flow (drive.api.download.*) instead. `estimate_download` is a cheap
+// DB-only size/count walk that decides which path to take.
+const CLIENT_ZIP_MAX_BYTES = 100 * 1024 * 1024 // 100 MB
+const CLIENT_ZIP_MAX_FILES = 2000
+
+function decideDownload(team, entities, filename) {
+  const names = entities.map((e) => e.name)
+  return fetch("/api/method/drive.api.download.estimate_download", {
+    method: "POST",
+    headers: {
+      "X-Frappe-CSRF-Token": window.csrf_token,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify({ team, entity_names: names }),
+  })
+    .then(async (response) => {
+      if (!response.ok) {
+        const body = await response.json().catch(() => null)
+        throw Object.assign(
+          new Error(
+            body?.messages?.[0] || `Failed to estimate download (${response.status})`
+          ),
+          { status: response.status }
+        )
+      }
+      return response.json()
+    })
+    .then(({ message }) => {
+      if (
+        message.total_size <= CLIENT_ZIP_MAX_BYTES &&
+        message.count <= CLIENT_ZIP_MAX_FILES
+      ) {
+        console.log("[Drive][Download] small -> client-side zip", message)
+        return clientZipDownload(team, entities, filename)
+      }
+      console.log("[Drive][Download] heavy -> server-side zip", message)
+      return serverZipDownload(team, names, filename)
+    })
+    .catch((error) => {
+      clearDownloadInProgress()
+      showDownloadError(
+        error,
+        "Couldn't download the selected files. Please try again."
+      )
+    })
+}
+
+const POLL_INTERVAL_MS = 2000
+// Keep polling as long as the server job is still running. The enqueued job has
+// a 30-minute timeout; give it nearly that long here before giving up. Real
+// builds finish in seconds now (media is STOREd, not re-compressed), so this
+// ceiling only matters if a job is genuinely stuck.
+const POLL_TIMEOUT_MS = 25 * 60 * 1000
+
+// Small-selection path: build the zip in the browser with JSZip (fast, no
+// queue latency). Docs become .html (no server-side PDF), links are skipped.
+function clientZipDownload(team, entities, filename) {
   const t = toast("Preparing download...")
   const zip = new JSZip()
-  console.log("[Drive][Download] branch: multi-select zip", { count: entities.length })
 
   const processEntity = async (entity, parentFolder) => {
+    if (entity.is_link) return
     if (entity.is_group) {
       const folder = parentFolder.folder(entity.title)
-      return get_children(team, entity.name).then((children) => {
-        const promises = children.map((childEntity) =>
-          processEntity(childEntity, folder)
-        )
-        return Promise.all(promises)
-      })
-    } else if (entity.document) {
-      const content = await getPdfFromDoc(entity.name)
-      parentFolder.file(entity.title + ".pdf", content)
-    } else {
-      const fileContent = await get_file_content(entity)
-      parentFolder.file(entity.title, fileContent)
+      const children = await get_children(team, entity.name)
+      for (const child of children) {
+        await processEntity(child, folder)
+      }
+      return
+    }
+    if (entity.document || entity.mime_type === "frappe_doc") {
+      const content = await get_doc_content(entity)
+      parentFolder.file(entity.title + ".html", content)
+      return
+    }
+    const fileContent = await get_file_content(entity)
+    parentFolder.file(entity.title, fileContent)
+  }
+
+  const processAll = async () => {
+    for (const entity of entities) {
+      await processEntity(entity, zip)
     }
   }
 
-  const promises = entities.map((entity) => processEntity(entity, zip))
-
-  Promise.all(promises)
-    .then(() => {
-      return zip.generateAsync({ type: "blob", streamFiles: true })
-    })
-    .then(async function (content) {
-      console.log("[Drive][Download] zip ready, triggering browser download")
-      var downloadLink = document.createElement("a")
+  return processAll()
+    .then(() => zip.generateAsync({ type: "blob", streamFiles: true }))
+    .then((content) => {
+      const downloadLink = document.createElement("a")
       downloadLink.href = URL.createObjectURL(content)
-      downloadLink.download = "Drive Download " + +new Date() + ".zip"
-
+      downloadLink.download = filename + ".zip"
       document.body.appendChild(downloadLink)
-
       downloadLink.click()
       document.body.removeChild(downloadLink)
       document.getElementById(t)?.remove()
@@ -202,79 +255,22 @@ export function entitiesDownload(team, entities, transfer = false) {
     })
 }
 
-export function folderDownload(team, root_entity) {
-  const folderName = root_entity.title
-  const zip = new JSZip()
-  const rootFolder = zip.folder(root_entity.title)
-  const t = toast("Preparing folder download...")
-  console.log("[Drive][Download] folderDownload start", {
-    team,
-    folder: root_entity.name,
-    title: root_entity.title,
-  })
-  temp(team, root_entity.name, rootFolder)
-    .then(() => {
-      return zip.generateAsync({ type: "blob", streamFiles: true })
+function get_doc_content(entity) {
+  return fetch(
+    `/api/method/drive.api.download.get_doc_content?entity_name=${entity.name}`
+  )
+    .then(async (response) => {
+      if (!response.ok) {
+        const body = await response.json().catch(() => null)
+        throw Object.assign(
+          new Error(
+            body?.messages?.[0] || `Failed to fetch doc content (${response.status})`
+          ),
+          { status: response.status }
+        )
+      }
+      return (await response.json()).message || ""
     })
-    .then((content) => {
-      console.log("[Drive][Download] folder zip ready, triggering browser download")
-      const downloadLink = document.createElement("a")
-      downloadLink.href = URL.createObjectURL(content)
-      downloadLink.download = folderName + ".zip"
-
-      document.body.appendChild(downloadLink)
-      downloadLink.click()
-      document.body.removeChild(downloadLink)
-      document.getElementById(t)?.remove()
-      clearDownloadInProgress()
-    })
-    .catch((error) => {
-      document.getElementById(t)?.remove()
-      clearDownloadInProgress()
-      showDownloadError(
-        error,
-        "Couldn't download this folder. Please try again."
-      )
-    })
-}
-
-function temp(team, entity_name, parentZip) {
-  console.log("[Drive][Download] temp: listing children", { team, entity_name })
-  return new Promise((resolve, reject) => {
-    get_children(team, entity_name)
-      .then((result) => {
-        console.log("[Drive][Download] temp: got children", {
-          entity_name,
-          count: (result || []).length,
-        })
-        const promises = result.map((entity) => {
-          if (entity.is_group) {
-            const folder = parentZip.folder(entity.title)
-            return temp(team, entity.name, folder)
-          }
-          if (entity.document) {
-            return getPdfFromDoc(entity.name).then((content) =>
-              parentZip.file(entity.title + ".pdf", content)
-            )
-          } else {
-            return get_file_content(entity).then((fileContent) => {
-              parentZip.file(entity.title, fileContent)
-            })
-          }
-        })
-
-        Promise.all(promises)
-          .then(() => {
-            resolve()
-          })
-          .catch((error) => {
-            reject(error)
-          })
-      })
-      .catch((error) => {
-        reject(error)
-      })
-  })
 }
 
 function get_file_content(entity) {
@@ -282,24 +278,13 @@ function get_file_content(entity) {
     entity.src ||
     "/api/method/" +
       `drive.api.files.get_file_content?entity_name=${entity.name}&trigger_download=1`
-
-  console.log("[Drive][Download] fetching file content", {
-    name: entity.name,
-    title: entity.title,
-    url: fileUrl,
-  })
   return fetch(fileUrl).then(async (response) => {
     if (response.ok) {
       return response.blob()
     } else if (response.status === 204) {
-      console.log(response)
+      return new Blob()
     } else {
       const body = await response.json().catch(() => null)
-      console.error("[Drive][Download] file content request failed", {
-        name: entity.name,
-        status: response.status,
-        statusText: response.statusText,
-      })
       throw Object.assign(
         new Error(
           body?.messages?.[0] ||
@@ -312,12 +297,9 @@ function get_file_content(entity) {
 }
 
 function get_children(team, entity_name) {
-  // drive.api.list.files defaults to limit=20 (one page). Pass an explicit
-  // high limit so folder downloads never silently truncate large folders.
   const url =
     "/api/method/" +
     `drive.api.list.files?team=${team}&entity_name=${entity_name}&limit=5000`
-  console.log("[Drive][Download] listing children", { url })
   return fetch(url, {
     method: "GET",
     headers: {
@@ -331,8 +313,7 @@ function get_children(team, entity_name) {
         const body = await response.json().catch(() => null)
         throw Object.assign(
           new Error(
-            body?.messages?.[0] ||
-              `Failed to list files (${response.status})`
+            body?.messages?.[0] || `Failed to list files (${response.status})`
           ),
           { status: response.status }
         )
@@ -340,4 +321,115 @@ function get_children(team, entity_name) {
       return response.json()
     })
     .then((json) => json.message)
+}
+
+// Builds the zip on the server (frappe.enqueue), polls until it's ready, then
+// streams the finished zip to the browser. Keeps heavy zipping off the browser
+// so large folders don't exhaust tab memory (RangeError) or trip fetch timeouts.
+function serverZipDownload(team, entity_names, filename) {
+  const t = toast("Preparing download...")
+  const progressEl = document.createElement("div")
+  progressEl.id = "drive-download-progress"
+  progressEl.style.cssText =
+    "position:fixed;top:1rem;left:50%;transform:translateX(-50%);" +
+    "z-index:9999;background:#1c1c1c;color:#fff;padding:.5rem 1rem;" +
+    "border-radius:.5rem;font-size:.875rem;box-shadow:0 2px 12px rgba(0,0,0,.35)"
+  document.body.appendChild(progressEl)
+
+  const removeProgress = () => {
+    document.getElementById("drive-download-progress")?.remove()
+  }
+
+  return fetch("/api/method/drive.api.download.download_zip", {
+    method: "POST",
+    headers: {
+      "X-Frappe-CSRF-Token": window.csrf_token,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify({ team, entity_names, filename }),
+  })
+    .then(async (response) => {
+      if (!response.ok) {
+        const body = await response.json().catch(() => null)
+        throw Object.assign(
+          new Error(
+            body?.messages?.[0] || `Failed to start download (${response.status})`
+          ),
+          { status: response.status }
+        )
+      }
+      return response.json()
+    })
+    .then(({ message }) => message.download_id)
+    .then((download_id) =>
+      pollDownloadStatus(download_id, (processed, total) => {
+        progressEl.textContent = `Zipping ${processed}/${total}…`
+      })
+    )
+    .then((download_id) => {
+      const url =
+        `/api/method/drive.api.download.get_download_zip` +
+        `?download_id=${download_id}`
+      const downloadLink = document.createElement("a")
+      downloadLink.href = url
+      downloadLink.download = ""
+      document.body.appendChild(downloadLink)
+      downloadLink.click()
+      document.body.removeChild(downloadLink)
+      document.getElementById(t)?.remove()
+      removeProgress()
+      clearDownloadInProgress()
+    })
+    .catch((error) => {
+      document.getElementById(t)?.remove()
+      removeProgress()
+      clearDownloadInProgress()
+      showDownloadError(
+        error,
+        "Couldn't download the selected files. Please try again."
+      )
+    })
+}
+
+function pollDownloadStatus(download_id, onProgress) {
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now()
+    const poll = () => {
+      fetch(
+        `/api/method/drive.api.download.download_status?download_id=${download_id}`
+      )
+        .then((response) => response.json())
+        .then(({ message }) => {
+          if (message.status === "ready") {
+            resolve(download_id)
+          } else if (message.status === "error") {
+            reject(
+              Object.assign(
+                new Error(message.message || "Download failed on the server."),
+                { status: 500 }
+              )
+            )
+          } else if (Date.now() - startedAt > POLL_TIMEOUT_MS) {
+            reject(
+              Object.assign(
+                new Error(
+                  "Download is still being prepared on the server. Please try again in a few minutes."
+                )
+                // no `status` here so showDownloadError keeps this friendly message
+              )
+            )
+          } else {
+            if (onProgress && message.total) {
+              onProgress(message.processed || 0, message.total)
+            }
+            setTimeout(poll, POLL_INTERVAL_MS)
+          }
+        })
+        .catch((error) => {
+          reject(error)
+        })
+    }
+    poll()
+  })
 }
