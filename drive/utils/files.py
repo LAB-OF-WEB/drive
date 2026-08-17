@@ -326,7 +326,7 @@ class FileManager:
                 leaf = path.relative_to(self.site_folder)
                 score = sum(1 for p in leaf.parts if p in chain_titles)
                 # Prefer the shallowest match as a tie-breaker
-                if score > best_score or (score == best_score and (best is None or len(leaf.parts) < len(best_leaf))):
+                if score > best_score or (score == best_score and (best is None or len(leaf.parts) < len(best_leaf.parts))):
                     best = path
                     best_score = score
                     best_leaf = leaf

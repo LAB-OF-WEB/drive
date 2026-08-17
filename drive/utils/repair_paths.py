@@ -332,6 +332,7 @@ def run(dry_run=False, conn=None, site_dir=None):
                 log(f"MISSING {name}: cannot compute canonical path")
                 continue
 
+            canonical = Path(canonical)
             canonical_str = str(canonical).rstrip("/")
             canonical_abs = SITE_FOLDER / canonical
 
